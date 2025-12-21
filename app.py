@@ -7,15 +7,15 @@ from openai import OpenAI
 
 
 # -------------------------------------------------
-# Page configuration
+# Page config
 # -------------------------------------------------
-st.set_page_config(
-    page_title="Clinical Article Digest",
-    layout="wide"
-)
+st.set_page_config(page_title="Clinical Article Digest", layout="wide")
 
 st.title("Clinical Article Digest")
-st.caption("Upload an Excel file → prioritize clinically actionable papers → expand abstracts")
+st.caption(
+    "Upload an Excel file → select the most clinically relevant articles → "
+    "read concise summaries and structured abstracts"
+)
 
 
 # -------------------------------------------------
@@ -29,9 +29,11 @@ REQUIRED_COLUMNS = [
     "Abstract",
 ]
 
+MAX_OUTPUT_ARTICLES = 20
+
 
 # -------------------------------------------------
-# Utility functions
+# Utilities
 # -------------------------------------------------
 def safe_str(x: Any) -> str:
     if x is None or pd.isna(x):
@@ -42,9 +44,7 @@ def safe_str(x: Any) -> str:
 def parse_date(x: Any) -> Optional[pd.Timestamp]:
     try:
         ts = pd.to_datetime(x, errors="coerce")
-        if pd.isna(ts):
-            return None
-        return ts
+        return None if pd.isna(ts) else ts
     except Exception:
         return None
 
@@ -56,9 +56,7 @@ def month_year_from_date(ts: Optional[pd.Timestamp]) -> Tuple[str, str]:
 
 
 def doi_to_url(doi: str) -> str:
-    if not doi:
-        return ""
-    return f"https://doi.org/{doi.strip()}"
+    return f"https://doi.org/{doi}" if doi else ""
 
 
 def validate_columns(df: pd.DataFrame) -> List[str]:
@@ -69,18 +67,16 @@ def build_articles(df: pd.DataFrame) -> List[Dict[str, Any]]:
     articles = []
 
     for _, row in df.iterrows():
+        title = safe_str(row.get("Article Title"))
+        if not title:
+            continue
+
         doi = safe_str(row.get("DOI"))
         journal = safe_str(row.get("Journal"))
-        title = safe_str(row.get("Article Title"))
         abstract = safe_str(row.get("Abstract"))
 
         ts = parse_date(row.get("Published Date"))
         month, year = month_year_from_date(ts)
-
-        link = doi_to_url(doi)
-
-        if not title:
-            continue
 
         articles.append(
             {
@@ -88,23 +84,22 @@ def build_articles(df: pd.DataFrame) -> List[Dict[str, Any]]:
                 "month": month,
                 "year": year,
                 "title": title,
-                "abstract": abstract,
                 "doi": doi,
-                "link": link,
+                "link": doi_to_url(doi),
+                "abstract": abstract,
             }
         )
 
-    # De-duplicate by DOI or title
+    # De-duplicate
     seen = set()
-    deduped = []
+    out = []
     for a in articles:
         key = a["doi"] or a["title"].lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(a)
+        if key not in seen:
+            seen.add(key)
+            out.append(a)
 
-    return deduped
+    return out
 
 
 # -------------------------------------------------
@@ -112,47 +107,68 @@ def build_articles(df: pd.DataFrame) -> List[Dict[str, Any]]:
 # -------------------------------------------------
 def get_openai_client_from_user() -> OpenAI:
     api_key = st.session_state.get("openai_api_key", "").strip()
-
     if not api_key:
-        st.warning("Please enter your OpenAI API key in the sidebar to continue.")
+        st.warning("Please enter your OpenAI API key in the sidebar.")
         st.stop()
-
     return OpenAI(api_key=api_key)
 
 
 # -------------------------------------------------
-# OpenAI call
+# OpenAI processing
 # -------------------------------------------------
-def prioritize_articles(
+def select_and_enrich_articles(
     client: OpenAI,
     model: str,
     articles: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
+    """
+    1) If >20 articles → select top 20 by clinical relevance
+    2) Sort by immediate clinical impact
+    3) Generate:
+       - 2-sentence clinical summary
+       - Structured abstract with bold highlights
+    """
 
     system_prompt = (
-        "You are a clinically oriented neurology editor. "
-        "Prioritize articles by likelihood of immediate impact on clinical practice. "
-        "Give priority to randomized trials, guideline-informing evidence, "
-        "and studies with direct diagnostic or therapeutic implications. "
-        "Return ONLY valid JSON."
+        "You are a senior clinical neurologist and journal editor. "
+        "Your task is to identify the articles with the highest immediate "
+        "clinical relevance and present them in a clinician-friendly format."
     )
 
-    user_payload = {
-        "task": (
-            "Sort the articles by immediate clinical implication (most actionable first). "
-            "Return a JSON object with a single key 'articles', which is a list. "
-            "Each item must contain exactly these keys: "
-            "journal, month, year, title, link, doi, abstract. "
-            "Do not invent data."
+    user_prompt = {
+        "instructions": (
+            "From the list of articles below:\n"
+            "1. If there are more than 20 articles, select ONLY the 20 most clinically relevant.\n"
+            "2. Rank them by immediate impact on clinical practice.\n"
+            "3. For each selected article, produce:\n"
+            "   - A brief clinical summary (max 2 sentences) focused on main conclusion and implications.\n"
+            "   - A structured abstract, broken into paragraphs when possible "
+            "     (Background, Methods, Results, Conclusion).\n"
+            "   - Highlight the most clinically important findings in **bold**.\n\n"
+            "Return ONLY valid JSON with the key 'articles'."
         ),
         "articles": articles,
+        "output_format": {
+            "articles": [
+                {
+                    "journal": "",
+                    "month": "",
+                    "year": "",
+                    "title": "",
+                    "doi": "",
+                    "link": "",
+                    "clinical_summary": "",
+                    "structured_abstract": "",
+                }
+            ]
+        },
     }
 
     response = client.responses.create(
         model=model,
         input=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+            {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
         ],
     )
 
@@ -160,8 +176,8 @@ def prioritize_articles(
         parsed = json.loads(response.output_text)
         return parsed["articles"]
     except Exception:
-        st.warning("Model output could not be parsed. Showing original order.")
-        return articles
+        st.error("Failed to parse model output.")
+        st.stop()
 
 
 # -------------------------------------------------
@@ -184,30 +200,19 @@ with st.sidebar:
         type="password",
         key="openai_api_key",
         placeholder="sk-...",
-        help="Used only for this session. Never stored."
     )
-
-    if st.session_state.get("openai_api_key"):
-        st.success("API key provided")
 
 
 # -------------------------------------------------
 # File upload
 # -------------------------------------------------
-uploaded_file = st.file_uploader(
-    "Upload Excel file (.xlsx)",
-    type=["xlsx"]
-)
+uploaded = st.file_uploader("Upload Excel file (.xlsx)", type=["xlsx"])
 
-if uploaded_file is None:
-    st.info("Please upload an Excel file to begin.")
+if uploaded is None:
+    st.info("Upload an Excel file to continue.")
     st.stop()
 
-try:
-    df = pd.read_excel(uploaded_file)
-except Exception as e:
-    st.error(f"Could not read Excel file: {e}")
-    st.stop()
+df = pd.read_excel(uploaded)
 
 missing = validate_columns(df)
 if missing:
@@ -215,19 +220,15 @@ if missing:
     st.stop()
 
 articles = build_articles(df)
-if not articles:
-    st.warning("No valid articles found.")
-    st.stop()
-
 st.success(f"{len(articles)} articles loaded.")
 
 
 # -------------------------------------------------
-# Run OpenAI prioritization
+# OpenAI processing
 # -------------------------------------------------
-with st.spinner("Prioritizing articles by clinical impact..."):
+with st.spinner("Selecting and enriching the most clinically relevant articles..."):
     client = get_openai_client_from_user()
-    prioritized = prioritize_articles(client, model, articles)
+    final_articles = select_and_enrich_articles(client, model, articles)
 
 
 # -------------------------------------------------
@@ -235,17 +236,24 @@ with st.spinner("Prioritizing articles by clinical impact..."):
 # -------------------------------------------------
 st.markdown("## Prioritized articles")
 
-for i, a in enumerate(prioritized, start=1):
-    header = f"**{a['journal']}, {a['month']} {a['year']}**".strip(", ")
+for i, a in enumerate(final_articles, start=1):
+    # Smaller header text (same level as title)
+    st.markdown(
+        f"**{i}. {a['journal']}, {a['month']} {a['year']}**",
+        help="Journal and publication date",
+    )
 
-    st.markdown(f"### {i}. {header}")
-
+    # Clickable title
     if a["link"]:
-        st.markdown(f"**[{a['title']}]({a['link']})**")
+        st.markdown(f"[{a['title']}]({a['link']})")
     else:
-        st.markdown(f"**{a['title']}**")
+        st.markdown(a["title"])
+
+    # Clinical summary
+    st.markdown(f"**Clinical summary:** {a['clinical_summary']}")
 
     st.caption(f"DOI: {a['doi'] or '—'}")
 
+    # Structured abstract
     with st.expander("Abstract"):
-        st.write(a["abstract"] or "No abstract available.")
+        st.markdown(a["structured_abstract"], unsafe_allow_html=False)
