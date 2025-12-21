@@ -23,7 +23,7 @@ st.caption(
 # =================================================
 PUBMED_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 
-MAX_LLM_RANK_POOL = 60          # hard cap sent to LLM
+MAX_LLM_RANK_POOL = 70          # hard cap sent to LLM
 RANK_CHUNK_SIZE = 10            # small to avoid TPM bursts
 RANK_ABSTRACT_MAX_CHARS = 1200  # aggressive truncation
 RANK_MODEL = "gpt-4.1"
