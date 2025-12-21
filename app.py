@@ -1,4 +1,5 @@
 import json
+import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -13,8 +14,7 @@ st.set_page_config(page_title="Clinical Article Digest", layout="wide")
 
 st.title("Clinical Article Digest")
 st.caption(
-    "Upload an Excel file → select the most clinically relevant articles → "
-    "read concise summaries and structured abstracts"
+    "Select the most clinically relevant articles → generate a podcast-style summary → download audio"
 )
 
 
@@ -90,7 +90,7 @@ def build_articles(df: pd.DataFrame) -> List[Dict[str, Any]]:
             }
         )
 
-    # De-duplicate
+    # Deduplicate
     seen = set()
     out = []
     for a in articles:
@@ -103,9 +103,9 @@ def build_articles(df: pd.DataFrame) -> List[Dict[str, Any]]:
 
 
 # -------------------------------------------------
-# OpenAI client (user-provided key)
+# OpenAI client (user key)
 # -------------------------------------------------
-def get_openai_client_from_user() -> OpenAI:
+def get_openai_client() -> OpenAI:
     api_key = st.session_state.get("openai_api_key", "").strip()
     if not api_key:
         st.warning("Please enter your OpenAI API key in the sidebar.")
@@ -116,52 +116,24 @@ def get_openai_client_from_user() -> OpenAI:
 # -------------------------------------------------
 # OpenAI processing
 # -------------------------------------------------
-def select_and_enrich_articles(
-    client: OpenAI,
-    model: str,
-    articles: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """
-    1) If >20 articles → select top 20 by clinical relevance
-    2) Sort by immediate clinical impact
-    3) Generate:
-       - 2-sentence clinical summary
-       - Structured abstract with bold highlights
-    """
-
+def select_and_enrich_articles(client: OpenAI, model: str, articles: List[Dict[str, Any]]):
     system_prompt = (
-        "You are a senior clinical neurologist and journal editor. "
-        "Your task is to identify the articles with the highest immediate "
-        "clinical relevance and present them in a clinician-friendly format."
+        "You are a senior clinical neurologist and medical editor. "
+        "Select the most clinically relevant articles and present them clearly for practicing physicians."
     )
 
     user_prompt = {
         "instructions": (
-            "From the list of articles below:\n"
-            "1. If there are more than 20 articles, select ONLY the 20 most clinically relevant.\n"
-            "2. Rank them by immediate impact on clinical practice.\n"
-            "3. For each selected article, produce:\n"
-            "   - A brief clinical summary (max 2 sentences) focused on main conclusion and implications.\n"
-            "   - A structured abstract, broken into paragraphs when possible "
-            "     (Background, Methods, Results, Conclusion).\n"
-            "   - Highlight the most clinically important findings in **bold**.\n\n"
-            "Return ONLY valid JSON with the key 'articles'."
+            "If there are more than 20 articles, select ONLY the 20 most clinically relevant. "
+            "Rank them by immediate impact on clinical practice. "
+            "For each selected article, generate:\n"
+            "- A brief clinical summary (max 2 sentences).\n"
+            "- A structured abstract with sections when possible "
+            "(Background, Methods, Results, Conclusion).\n"
+            "- Highlight the most clinically important findings in **bold**.\n\n"
+            "Return ONLY valid JSON."
         ),
         "articles": articles,
-        "output_format": {
-            "articles": [
-                {
-                    "journal": "",
-                    "month": "",
-                    "year": "",
-                    "title": "",
-                    "doi": "",
-                    "link": "",
-                    "clinical_summary": "",
-                    "structured_abstract": "",
-                }
-            ]
-        },
     }
 
     response = client.responses.create(
@@ -172,12 +144,48 @@ def select_and_enrich_articles(
         ],
     )
 
-    try:
-        parsed = json.loads(response.output_text)
-        return parsed["articles"]
-    except Exception:
-        st.error("Failed to parse model output.")
-        st.stop()
+    parsed = json.loads(response.output_text)
+    return parsed["articles"]
+
+
+def generate_podcast_script(client: OpenAI, model: str, selected_articles: List[Dict[str, Any]]) -> str:
+    system_prompt = (
+        "You are a medical podcast host speaking to neurologists. "
+        "Your tone is clear, engaging, and clinically focused."
+    )
+
+    user_prompt = {
+        "task": (
+            "Create a podcast-style script lasting approximately 10 minutes "
+            "(~1300–1500 words). The script should:\n"
+            "- Be written for spoken audio\n"
+            "- Smoothly transition between topics\n"
+            "- Summarize and contextualize the selected studies\n"
+            "- Emphasize clinical relevance and practice implications\n"
+            "- Avoid reading abstracts verbatim\n"
+        ),
+        "articles": selected_articles,
+    }
+
+    response = client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
+        ],
+    )
+
+    return response.output_text
+
+
+def generate_tts_audio(client: OpenAI, script: str) -> bytes:
+    # OpenAI TTS (mp3)
+    speech = client.audio.speech.create(
+        model="gpt-4o-mini-tts",
+        voice="alloy",
+        input=script,
+    )
+    return speech.read()
 
 
 # -------------------------------------------------
@@ -220,40 +228,63 @@ if missing:
     st.stop()
 
 articles = build_articles(df)
-st.success(f"{len(articles)} articles loaded.")
 
-
-# -------------------------------------------------
-# OpenAI processing
-# -------------------------------------------------
 with st.spinner("Selecting and enriching the most clinically relevant articles..."):
-    client = get_openai_client_from_user()
+    client = get_openai_client()
     final_articles = select_and_enrich_articles(client, model, articles)
 
 
 # -------------------------------------------------
-# Output
+# Output + selection
 # -------------------------------------------------
 st.markdown("## Prioritized articles")
 
+selected_for_podcast = []
+
 for i, a in enumerate(final_articles, start=1):
-    # Smaller header text (same level as title)
-    st.markdown(
-        f"**{i}. {a['journal']}, {a['month']} {a['year']}**",
-        help="Journal and publication date",
+    checked = st.checkbox(
+        f"Include in podcast: {a['title']}",
+        key=f"select_{i}",
     )
 
-    # Clickable title
-    if a["link"]:
-        st.markdown(f"[{a['title']}]({a['link']})")
-    else:
-        st.markdown(a["title"])
+    if checked:
+        selected_for_podcast.append(a)
 
-    # Clinical summary
+    st.markdown(f"**{i}. {a['journal']}, {a['month']} {a['year']}**")
+
+    st.markdown(f"[{a['title']}]({a['link']})")
     st.markdown(f"**Clinical summary:** {a['clinical_summary']}")
-
     st.caption(f"DOI: {a['doi'] or '—'}")
 
-    # Structured abstract
     with st.expander("Abstract"):
-        st.markdown(a["structured_abstract"], unsafe_allow_html=False)
+        st.markdown(a["structured_abstract"])
+
+
+# -------------------------------------------------
+# Podcast generation
+# -------------------------------------------------
+st.markdown("---")
+st.markdown("## 🎙️ Podcast")
+
+if st.button("Generate podcast script from selected articles"):
+    if not selected_for_podcast:
+        st.warning("Please select at least one article.")
+    else:
+        with st.spinner("Generating podcast script..."):
+            script = generate_podcast_script(client, model, selected_for_podcast)
+            st.session_state["podcast_script"] = script
+
+if "podcast_script" in st.session_state:
+    with st.expander("Podcast script preview"):
+        st.write(st.session_state["podcast_script"])
+
+    if st.button("Generate audio podcast (MP3)"):
+        with st.spinner("Generating audio..."):
+            audio_bytes = generate_tts_audio(client, st.session_state["podcast_script"])
+
+            st.download_button(
+                label="Download podcast audio (MP3)",
+                data=audio_bytes,
+                file_name="clinical_podcast.mp3",
+                mime="audio/mpeg",
+            )
