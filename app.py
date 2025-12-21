@@ -1,5 +1,4 @@
 import re
-import math
 import requests
 import feedparser
 import streamlit as st
@@ -9,33 +8,33 @@ from typing import List, Dict, Any, Optional, Tuple
 from openai import OpenAI
 
 
-# -------------------------------------------------
+# =================================================
 # Page setup
-# -------------------------------------------------
+# =================================================
 st.set_page_config(page_title="PubMed RSS – Clinical Digest", layout="wide")
 st.title("PubMed RSS – Clinical Digest")
 st.caption(
-    "Paste a PubMed RSS link → rank by immediate clinical relevance → show top 20 with summaries + improved abstracts"
+    "Paste a PubMed RSS link → rank by immediate clinical relevance → "
+    "display the most relevant articles with concise summaries"
 )
 
-# -------------------------------------------------
+
+# =================================================
 # Constants / knobs
-# -------------------------------------------------
+# =================================================
 PUBMED_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-TOP_K = 20
 
-# Ranking safety knobs
-RANK_CHUNK_SIZE = 15          # number of articles per LLM ranking call
-RANK_ABSTRACT_MAX_CHARS = 1800  # truncate abstract sent for ranking
+# Ranking safety
+RANK_CHUNK_SIZE = 15            # articles per ranking call
+RANK_ABSTRACT_MAX_CHARS = 1800  # truncate abstracts for ranking
 
-# Enrichment models (keep consistent for debugging)
 RANK_MODEL = "gpt-4.1"
 ENRICH_MODEL = "gpt-4.1"
 
 
-# -------------------------------------------------
+# =================================================
 # Helpers
-# -------------------------------------------------
+# =================================================
 def extract_pmid_from_link(link: str) -> Optional[str]:
     match = re.search(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d+)/", link)
     return match.group(1) if match else None
@@ -48,8 +47,7 @@ def fetch_pmids_from_rss(rss_url: str) -> List[str]:
         pmid = extract_pmid_from_link(getattr(entry, "link", "") or "")
         if pmid:
             pmids.append(pmid)
-    # de-duplicate preserving order
-    return list(dict.fromkeys(pmids))
+    return list(dict.fromkeys(pmids))  # de-duplicate, preserve order
 
 
 def fetch_pubmed_articles(pmids: List[str]) -> List[Dict[str, Any]]:
@@ -81,11 +79,11 @@ def fetch_pubmed_articles(pmids: List[str]) -> List[Dict[str, Any]]:
 
         abstract_parts = article.findall(".//AbstractText")
         abstract = "\n".join(
-            (part.text or "").strip() for part in abstract_parts if (part.text or "").strip()
+            (part.text or "").strip()
+            for part in abstract_parts
+            if (part.text or "").strip()
         ).strip()
 
-        # Some PubMed entries have no abstract; we can still rank by title/journal/date
-        # but enrichment will be limited. Keep them; the ranker can decide.
         if not title:
             continue
 
@@ -102,20 +100,20 @@ def fetch_pubmed_articles(pmids: List[str]) -> List[Dict[str, Any]]:
     return articles
 
 
-def truncate_text(s: str, max_chars: int) -> str:
-    s = (s or "").strip()
-    if len(s) <= max_chars:
-        return s
-    return s[:max_chars].rstrip() + "…"
+def truncate_text(text: str, max_chars: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "…"
 
 
-def chunk_list(items: List[Any], chunk_size: int) -> List[List[Any]]:
-    return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
+def chunk_list(items: List[Any], size: int) -> List[List[Any]]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
 
 
-# -------------------------------------------------
+# =================================================
 # OpenAI helpers
-# -------------------------------------------------
+# =================================================
 def get_openai_client() -> OpenAI:
     api_key = st.session_state.get("openai_api_key", "").strip()
     if not api_key:
@@ -130,12 +128,11 @@ def rank_articles_by_relevance(
 ) -> List[Tuple[int, float]]:
     """
     Returns list of (index_in_articles, score) sorted by score desc.
-    Uses plain-text scoring to avoid SDK structured-output issues.
+    Uses plain-text scoring for maximum SDK compatibility.
     """
 
     ranked: List[Tuple[int, float]] = []
 
-    # Build lightweight payload
     payload = []
     for idx, a in enumerate(articles):
         payload.append(
@@ -159,26 +156,36 @@ def rank_articles_by_relevance(
                     "role": "system",
                     "content": (
                         "You are a senior clinical neurologist and journal editor. "
-                        "Score each article by likelihood of IMMEDIATE clinical impact."
+                        "Score each article by likelihood of IMMEDIATE impact on clinical practice."
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
-                        "For each article below, assign a relevance score from 0 to 100.\n"
-                        "Higher = more immediately actionable in clinical practice.\n\n"
+                        "Score each article below from 0 to 100 based on immediate clinical relevance.\n\n"
+                        "Scoring guidance:\n"
+                        "- Highest scores: randomized clinical trials with positive or practice-changing results, "
+                        "guideline-informing evidence, or large high-quality cohorts.\n"
+                        "- Intermediate scores: randomized clinical trials with NEGATIVE or neutral results that "
+                        "still meaningfully inform clinical decision-making.\n"
+                        "- Lower scores: observational studies with limited applicability.\n"
+                        "- Lowest scores: basic science, small case series, hypothesis-generating work without "
+                        "clear actionable clinical implications.\n\n"
+                        "IMPORTANT:\n"
+                        "- Negative RCTs MUST score higher than basic science, small case series, or purely "
+                        "hypothesis-generating studies.\n\n"
                         "Output format (STRICT):\n"
                         "id | score\n"
-                        "One article per line. No explanations.\n\n"
+                        "One article per line.\n"
+                        "No explanations.\n\n"
                         f"{batch}"
                     ),
                 },
             ],
         )
 
-        text = response.output_text.strip().splitlines()
-
-        for line in text:
+        lines = response.output_text.strip().splitlines()
+        for line in lines:
             if "|" not in line:
                 continue
             try:
@@ -193,7 +200,6 @@ def rank_articles_by_relevance(
 
     progress.empty()
 
-    # Fill missing with low score
     seen = {i for i, _ in ranked}
     for i in range(len(articles)):
         if i not in seen:
@@ -219,8 +225,8 @@ def generate_clinical_summary(client: OpenAI, abstract: str) -> str:
             {
                 "role": "user",
                 "content": (
-                    "Summarize the most important conclusion of this article and its clinical implications "
-                    "in no more than 2 sentences:\n\n"
+                    "Summarize the most important conclusion of this article and its "
+                    "clinical implications in no more than 2 sentences:\n\n"
                     f"{abstract}"
                 ),
             },
@@ -245,8 +251,8 @@ def generate_structured_abstract(client: OpenAI, abstract: str) -> str:
             {
                 "role": "user",
                 "content": (
-                    "Rewrite the abstract below into structured paragraphs (Background, Methods, Results, Conclusion) "
-                    "WHEN appropriate. If the abstract does not support a clean split, keep logical paragraphs anyway. "
+                    "Rewrite the abstract below into structured paragraphs "
+                    "(Background, Methods, Results, Conclusion) when appropriate. "
                     "Bold the most clinically important findings.\n\n"
                     f"{abstract}"
                 ),
@@ -256,9 +262,9 @@ def generate_structured_abstract(client: OpenAI, abstract: str) -> str:
     return response.output_text.strip()
 
 
-# -------------------------------------------------
+# =================================================
 # Sidebar
-# -------------------------------------------------
+# =================================================
 with st.sidebar:
     st.subheader("OpenAI API Key")
     st.text_input(
@@ -267,13 +273,23 @@ with st.sidebar:
         key="openai_api_key",
         placeholder="sk-...",
     )
+
     st.markdown("---")
-    st.caption("This step ranks articles (chunked) and then enriches only the top 20.")
+    st.subheader("Ranking settings")
+
+    top_k = st.number_input(
+        "Number of top articles to display",
+        min_value=1,
+        max_value=100,
+        value=20,
+        step=1,
+        help="How many of the most clinically relevant articles should be ranked and displayed.",
+    )
 
 
-# -------------------------------------------------
+# =================================================
 # RSS input
-# -------------------------------------------------
+# =================================================
 rss_url = st.text_input(
     "Paste PubMed RSS link",
     placeholder="https://pubmed.ncbi.nlm.nih.gov/rss/search/...",
@@ -284,10 +300,10 @@ if not rss_url:
     st.stop()
 
 
-# -------------------------------------------------
-# Fetch from PubMed
-# -------------------------------------------------
-with st.spinner("Fetching articles from PubMed (RSS → PMIDs → E-utilities)…"):
+# =================================================
+# Fetch articles
+# =================================================
+with st.spinner("Fetching articles from PubMed…"):
     try:
         pmids = fetch_pmids_from_rss(rss_url)
         articles = fetch_pubmed_articles(pmids)
@@ -302,37 +318,38 @@ if not articles:
 st.success(f"Retrieved {len(articles)} articles from PubMed.")
 
 
-# -------------------------------------------------
-# Rank and keep top 20
-# -------------------------------------------------
+# =================================================
+# Rank + select Top N
+# =================================================
 client = get_openai_client()
 
 with st.spinner("Ranking articles by immediate clinical relevance…"):
     ranked = rank_articles_by_relevance(client, articles)
 
-top_ranked = ranked[: min(TOP_K, len(ranked))]
+top_ranked = ranked[: min(top_k, len(ranked))]
 top_articles = [(i, score, articles[i]) for i, score in top_ranked]
 
 st.markdown(f"## Top {len(top_articles)} most clinically relevant articles")
+st.caption(
+    "Ranking prioritizes immediately actionable clinical evidence. "
+    "Negative RCTs are ranked above basic science and non-actionable studies."
+)
 
 
-# -------------------------------------------------
-# Display top 20 with enrichment
-# -------------------------------------------------
+# =================================================
+# Display results
+# =================================================
 for display_idx, (orig_idx, score, article) in enumerate(top_articles, start=1):
     header = f"{article.get('journal','')}, {article.get('month','')} {article.get('year','')} — {article.get('title','')}"
     header = re.sub(r"\s+", " ", header).strip(" ,—")
 
-    # Smaller text (same size as title): use bold inline text, not markdown headings
     st.markdown(f"**{display_idx}. {header}**")
     st.caption(f"Relevance score: {score:.1f}/100")
 
-    # Summary immediately under title
     with st.spinner("Generating clinical summary…"):
         summary = generate_clinical_summary(client, article.get("abstract", ""))
     st.markdown(summary)
 
-    # Structured abstract with bold highlights
     with st.expander("Abstract"):
         with st.spinner("Formatting abstract…"):
             structured = generate_structured_abstract(client, article.get("abstract", ""))
