@@ -170,10 +170,6 @@ def select_and_enrich_articles(
 
     response = client.responses.parse(
         model=model,
-        response_format={
-            "type": "json_schema",
-            "json_schema": schema,
-        },
         input=[
             {
                 "role": "system",
@@ -198,10 +194,11 @@ def select_and_enrich_articles(
                 "content": json.dumps(articles, ensure_ascii=False),
             },
         ],
+        schema=schema,  # ✅ CORRECT for openai==2.14.0
     )
 
-    # ✅ Guaranteed structured output
     return response.output_parsed["articles"]
+
 
 
 def generate_podcast_script(
