@@ -1,4 +1,3 @@
-```python
 import re
 import time
 import hashlib
@@ -597,4 +596,4 @@ if "podcast_text" in st.session_state and st.session_state["podcast_text"].strip
         )
 else:
     st.info("Select at least one article above, then generate a podcast script to enable audio.")
-```
+
