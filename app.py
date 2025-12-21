@@ -2,35 +2,38 @@ import json
 import re
 import requests
 import feedparser
-from typing import Any, Dict, List, Optional, Tuple
+import xml.etree.ElementTree as ET
+from typing import Any, Dict, List, Optional
 
 import streamlit as st
 from openai import OpenAI
-import xml.etree.ElementTree as ET
 
 
-# -------------------------------------------------
-# Page config
-# -------------------------------------------------
-st.set_page_config(page_title="Clinical Article Digest (PubMed RSS)", layout="wide")
+# =================================================
+# Page configuration
+# =================================================
+st.set_page_config(
+    page_title="Clinical Article Digest – PubMed RSS",
+    layout="wide",
+)
 
 st.title("Clinical Article Digest – PubMed RSS")
 st.caption(
-    "Paste a PubMed RSS link → select the most clinically relevant articles → "
+    "Paste a PubMed RSS link → review the most clinically relevant articles → "
     "generate a podcast-style summary and audio"
 )
 
 
-# -------------------------------------------------
+# =================================================
 # Constants
-# -------------------------------------------------
+# =================================================
 MAX_OUTPUT_ARTICLES = 20
 PUBMED_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 
 
-# -------------------------------------------------
-# Utilities
-# -------------------------------------------------
+# =================================================
+# Utility helpers
+# =================================================
 def safe_str(x: Any) -> str:
     return "" if x is None else str(x).strip()
 
@@ -40,17 +43,13 @@ def doi_to_url(doi: str) -> str:
 
 
 def extract_pmid_from_link(link: str) -> Optional[str]:
-    """
-    PubMed RSS links usually look like:
-    https://pubmed.ncbi.nlm.nih.gov/12345678/
-    """
     match = re.search(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d+)/", link)
     return match.group(1) if match else None
 
 
-# -------------------------------------------------
-# PubMed RSS + API
-# -------------------------------------------------
+# =================================================
+# PubMed RSS + E-utilities
+# =================================================
 def fetch_pmids_from_rss(rss_url: str) -> List[str]:
     feed = feedparser.parse(rss_url)
     pmids = []
@@ -60,7 +59,7 @@ def fetch_pmids_from_rss(rss_url: str) -> List[str]:
         if pmid:
             pmids.append(pmid)
 
-    return list(dict.fromkeys(pmids))  # de-duplicate
+    return list(dict.fromkeys(pmids))
 
 
 def fetch_pubmed_articles(pmids: List[str]) -> List[Dict[str, Any]]:
@@ -81,23 +80,24 @@ def fetch_pubmed_articles(pmids: List[str]) -> List[Dict[str, Any]]:
 
     for article in root.findall(".//PubmedArticle"):
         medline = article.find("MedlineCitation")
-        article_data = medline.find("Article")
+        art = medline.find("Article")
 
-        title = safe_str(article_data.findtext("ArticleTitle"))
-        abstract_elems = article_data.findall(".//AbstractText")
-        abstract = "\n".join([safe_str(a.text) for a in abstract_elems])
+        title = safe_str(art.findtext("ArticleTitle"))
+        journal = safe_str(art.findtext("Journal/Title"))
 
-        journal = safe_str(article_data.findtext("Journal/Title"))
+        abstract_parts = art.findall(".//AbstractText")
+        abstract = "\n".join(safe_str(a.text) for a in abstract_parts)
 
-        # Publication date
-        year = safe_str(article_data.findtext("Journal/JournalIssue/PubDate/Year"))
-        month = safe_str(article_data.findtext("Journal/JournalIssue/PubDate/Month"))
+        year = safe_str(art.findtext("Journal/JournalIssue/PubDate/Year"))
+        month = safe_str(art.findtext("Journal/JournalIssue/PubDate/Month"))
 
-        # DOI
         doi = ""
         for id_elem in article.findall(".//ArticleId"):
             if id_elem.attrib.get("IdType") == "doi":
                 doi = safe_str(id_elem.text)
+
+        if not title or not abstract:
+            continue
 
         articles.append(
             {
@@ -114,9 +114,9 @@ def fetch_pubmed_articles(pmids: List[str]) -> List[Dict[str, Any]]:
     return articles
 
 
-# -------------------------------------------------
-# OpenAI
-# -------------------------------------------------
+# =================================================
+# OpenAI client (user-provided key)
+# =================================================
 def get_openai_client() -> OpenAI:
     api_key = st.session_state.get("openai_api_key", "").strip()
     if not api_key:
@@ -125,44 +125,89 @@ def get_openai_client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 
+# =================================================
+# OpenAI – Structured Outputs (CRITICAL FIX)
+# =================================================
 def select_and_enrich_articles(
     client: OpenAI,
     model: str,
     articles: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
 
-    system_prompt = (
-        "You are a senior clinical neurologist and journal editor. "
-        "Identify the articles with the highest immediate clinical relevance."
-    )
-
-    user_prompt = {
-        "instructions": (
-            "From the list below:\n"
-            "1. If more than 20 articles, select ONLY the top 20 by immediate clinical impact.\n"
-            "2. Rank them by clinical relevance.\n"
-            "3. For each article, generate:\n"
-            "   - A brief clinical summary (max 2 sentences).\n"
-            "   - A structured abstract (Background, Methods, Results, Conclusion when possible).\n"
-            "   - Highlight key clinically relevant findings in **bold**.\n\n"
-            "Return ONLY valid JSON with key 'articles'."
-        ),
-        "articles": articles,
+    schema = {
+        "type": "object",
+        "properties": {
+            "articles": {
+                "type": "array",
+                "maxItems": MAX_OUTPUT_ARTICLES,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "journal": {"type": "string"},
+                        "month": {"type": "string"},
+                        "year": {"type": "string"},
+                        "title": {"type": "string"},
+                        "doi": {"type": "string"},
+                        "link": {"type": "string"},
+                        "clinical_summary": {"type": "string"},
+                        "structured_abstract": {"type": "string"},
+                    },
+                    "required": [
+                        "journal",
+                        "month",
+                        "year",
+                        "title",
+                        "doi",
+                        "link",
+                        "clinical_summary",
+                        "structured_abstract",
+                    ],
+                },
+            }
+        },
+        "required": ["articles"],
     }
 
     response = client.responses.create(
         model=model,
+        response_format={
+            "type": "json_schema",
+            "json_schema": schema,
+        },
         input=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
+            {
+                "role": "system",
+                "content": (
+                    "You are a senior clinical neurologist and medical journal editor. "
+                    "Select the articles with the highest immediate clinical relevance."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "From the provided articles:\n"
+                    "- If more than 20, select ONLY the top 20.\n"
+                    "- Rank by immediate clinical impact.\n"
+                    "- Write a clinical summary (max 2 sentences).\n"
+                    "- Provide a structured abstract (Background, Methods, Results, Conclusion).\n"
+                    "- Highlight key findings in **bold**."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(articles, ensure_ascii=False),
+            },
         ],
     )
 
-    parsed = json.loads(response.output_text)
-    return parsed["articles"]
+    return response.output_parsed["articles"]
 
 
-def generate_podcast_script(client: OpenAI, model: str, selected_articles: List[Dict[str, Any]]) -> str:
+def generate_podcast_script(
+    client: OpenAI,
+    model: str,
+    selected_articles: List[Dict[str, Any]],
+) -> str:
     response = client.responses.create(
         model=model,
         input=[
@@ -176,8 +221,8 @@ def generate_podcast_script(client: OpenAI, model: str, selected_articles: List[
                     {
                         "task": (
                             "Create a podcast-style script of about 10 minutes "
-                            "(~1300–1500 words). Use spoken language, smooth transitions, "
-                            "and emphasize clinical implications."
+                            "(~1300–1500 words). Use natural spoken language, "
+                            "smooth transitions, and focus on clinical implications."
                         ),
                         "articles": selected_articles,
                     },
@@ -189,18 +234,18 @@ def generate_podcast_script(client: OpenAI, model: str, selected_articles: List[
     return response.output_text
 
 
-def generate_tts_audio(client: OpenAI, text: str) -> bytes:
+def generate_tts_audio(client: OpenAI, script: str) -> bytes:
     speech = client.audio.speech.create(
         model="gpt-4o-mini-tts",
         voice="alloy",
-        input=text,
+        input=script,
     )
     return speech.read()
 
 
-# -------------------------------------------------
+# =================================================
 # Sidebar
-# -------------------------------------------------
+# =================================================
 with st.sidebar:
     st.header("Settings")
 
@@ -221,9 +266,9 @@ with st.sidebar:
     )
 
 
-# -------------------------------------------------
+# =================================================
 # RSS input
-# -------------------------------------------------
+# =================================================
 rss_url = st.text_input(
     "Paste PubMed RSS link",
     placeholder="https://pubmed.ncbi.nlm.nih.gov/rss/search/...",
@@ -234,10 +279,10 @@ if not rss_url:
     st.stop()
 
 
-# -------------------------------------------------
+# =================================================
 # Fetch articles
-# -------------------------------------------------
-with st.spinner("Fetching articles from PubMed RSS..."):
+# =================================================
+with st.spinner("Fetching articles from PubMed..."):
     pmids = fetch_pmids_from_rss(rss_url)
     articles = fetch_pubmed_articles(pmids)
 
@@ -248,23 +293,26 @@ if not articles:
 st.success(f"{len(articles)} articles retrieved from PubMed.")
 
 
-# -------------------------------------------------
-# OpenAI enrichment
-# -------------------------------------------------
+# =================================================
+# Enrichment
+# =================================================
 with st.spinner("Selecting and enriching the most clinically relevant articles..."):
     client = get_openai_client()
     final_articles = select_and_enrich_articles(client, model, articles)
 
 
-# -------------------------------------------------
+# =================================================
 # Display + selection
-# -------------------------------------------------
+# =================================================
 st.markdown("## Prioritized articles")
 
 selected_for_podcast = []
 
 for i, a in enumerate(final_articles, start=1):
-    checked = st.checkbox(f"Include in podcast: {a['title']}", key=f"select_{i}")
+    checked = st.checkbox(
+        f"Include in podcast: {a['title']}",
+        key=f"select_{i}",
+    )
 
     if checked:
         selected_for_podcast.append(a)
@@ -278,9 +326,9 @@ for i, a in enumerate(final_articles, start=1):
         st.markdown(a["structured_abstract"])
 
 
-# -------------------------------------------------
+# =================================================
 # Podcast
-# -------------------------------------------------
+# =================================================
 st.markdown("---")
 st.markdown("## 🎙️ Podcast")
 
@@ -289,8 +337,9 @@ if st.button("Generate podcast script from selected articles"):
         st.warning("Select at least one article.")
     else:
         with st.spinner("Generating podcast script..."):
-            script = generate_podcast_script(client, model, selected_for_podcast)
-            st.session_state["podcast_script"] = script
+            st.session_state["podcast_script"] = generate_podcast_script(
+                client, model, selected_for_podcast
+            )
 
 if "podcast_script" in st.session_state:
     with st.expander("Podcast script preview"):
