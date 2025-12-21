@@ -139,7 +139,7 @@ def select_and_enrich_articles(
         "properties": {
             "articles": {
                 "type": "array",
-                "maxItems": MAX_OUTPUT_ARTICLES,
+                "maxItems": 20,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -168,7 +168,7 @@ def select_and_enrich_articles(
         "required": ["articles"],
     }
 
-    response = client.responses.create(
+    response = client.responses.parse(
         model=model,
         response_format={
             "type": "json_schema",
@@ -200,6 +200,7 @@ def select_and_enrich_articles(
         ],
     )
 
+    # ✅ Guaranteed structured output
     return response.output_parsed["articles"]
 
 
