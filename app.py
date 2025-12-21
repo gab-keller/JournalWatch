@@ -129,33 +129,16 @@ def rank_articles_by_relevance(
     articles: List[Dict[str, Any]],
 ) -> List[Tuple[int, float]]:
     """
-    Returns list of (index_in_articles, score) where higher is more clinically actionable.
-    Uses chunked calls and a schema-enforced parse to avoid JSON formatting issues.
+    Returns list of (index_in_articles, score) sorted by score desc.
+    Uses plain-text scoring to avoid SDK structured-output issues.
     """
 
-    # Schema for one ranking batch
-    schema = {
-        "type": "object",
-        "properties": {
-            "scores": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "integer"},
-                        "score": {"type": "number"},
-                    },
-                    "required": ["id", "score"],
-                },
-            }
-        },
-        "required": ["scores"],
-    }
+    ranked: List[Tuple[int, float]] = []
 
-    # Build “ranking payload” with truncated abstracts to keep tokens manageable
-    rank_payload = []
+    # Build lightweight payload
+    payload = []
     for idx, a in enumerate(articles):
-        rank_payload.append(
+        payload.append(
             {
                 "id": idx,
                 "title": a.get("title", ""),
@@ -165,54 +148,57 @@ def rank_articles_by_relevance(
             }
         )
 
-    ranked: List[Tuple[int, float]] = []
-
-    batches = chunk_list(rank_payload, RANK_CHUNK_SIZE)
+    batches = chunk_list(payload, RANK_CHUNK_SIZE)
     progress = st.progress(0.0, text="Ranking articles by clinical relevance…")
 
     for bi, batch in enumerate(batches):
-        # We ask for a 0–100 score. The model is forced to output schema.
-        response = client.responses.parse(
+        response = client.responses.create(
             model=RANK_MODEL,
-            schema=schema,
             input=[
                 {
                     "role": "system",
                     "content": (
                         "You are a senior clinical neurologist and journal editor. "
-                        "Score each article by likelihood of IMMEDIATE clinical impact (0–100). "
-                        "Prioritize: randomized clinical trials, guideline-informing evidence, large high-quality cohorts, "
-                        "practice-changing diagnostics/therapeutics, and results that would change management now. "
-                        "Lower score: basic science, small case series, hypothesis-generating work without actionable steps."
+                        "Score each article by likelihood of IMMEDIATE clinical impact."
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
-                        "Return a score for each item. "
-                        "Use only the provided information. "
-                        "Score range: 0 to 100 (higher = more immediately actionable)."
+                        "For each article below, assign a relevance score from 0 to 100.\n"
+                        "Higher = more immediately actionable in clinical practice.\n\n"
+                        "Output format (STRICT):\n"
+                        "id | score\n"
+                        "One article per line. No explanations.\n\n"
+                        f"{batch}"
                     ),
                 },
-                {"role": "user", "content": str(batch)},
             ],
         )
 
-        parsed = response.output_parsed
-        for item in parsed.get("scores", []):
-            ranked.append((int(item["id"]), float(item["score"])))
+        text = response.output_text.strip().splitlines()
 
-        progress.progress((bi + 1) / max(1, len(batches)), text="Ranking articles by clinical relevance…")
+        for line in text:
+            if "|" not in line:
+                continue
+            try:
+                left, right = line.split("|", 1)
+                idx = int(left.strip())
+                score = float(right.strip())
+                ranked.append((idx, score))
+            except Exception:
+                continue
+
+        progress.progress((bi + 1) / max(1, len(batches)))
 
     progress.empty()
 
-    # If any IDs missing (rare), assign neutral low score
-    got = {i for i, _ in ranked}
+    # Fill missing with low score
+    seen = {i for i, _ in ranked}
     for i in range(len(articles)):
-        if i not in got:
+        if i not in seen:
             ranked.append((i, 0.0))
 
-    # Sort by score desc
     ranked.sort(key=lambda x: x[1], reverse=True)
     return ranked
 
