@@ -14,8 +14,8 @@ from openai import OpenAI, RateLimitError
 st.set_page_config(page_title="PubMed RSS – Clinical Digest", layout="wide")
 st.title("PubMed RSS – Clinical Digest")
 st.caption(
-    "Robust clinical literature ranking from PubMed RSS "
-    "(designed to scale to 100+ articles safely)"
+    "Scalable clinical literature ranking from PubMed RSS "
+    "(robust for 100+ articles)"
 )
 
 # =================================================
@@ -23,9 +23,10 @@ st.caption(
 # =================================================
 PUBMED_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 
-MAX_LLM_RANK_POOL = 70          # hard cap sent to LLM
-RANK_CHUNK_SIZE = 10            # small to avoid TPM bursts
-RANK_ABSTRACT_MAX_CHARS = 1200  # aggressive truncation
+MAX_LLM_RANK_POOL = 40
+RANK_CHUNK_SIZE = 10
+RANK_ABSTRACT_MAX_CHARS = 1200
+
 RANK_MODEL = "gpt-4.1"
 ENRICH_MODEL = "gpt-4.1"
 
@@ -77,6 +78,11 @@ def fetch_pubmed_articles(pmids: List[str]) -> List[Dict[str, Any]]:
             (p.text or "").strip() for p in abstract_parts if p.text
         ).strip()
 
+        doi = ""
+        for aid in pa.findall(".//ArticleId"):
+            if aid.attrib.get("IdType") == "doi":
+                doi = (aid.text or "").strip()
+
         if not title:
             continue
 
@@ -87,6 +93,8 @@ def fetch_pubmed_articles(pmids: List[str]) -> List[Dict[str, Any]]:
                 "year": year,
                 "month": month,
                 "abstract": abstract,
+                "doi": doi,
+                "doi_url": f"https://doi.org/{doi}" if doi else "",
             }
         )
 
@@ -94,38 +102,31 @@ def fetch_pubmed_articles(pmids: List[str]) -> List[Dict[str, Any]]:
 
 
 # =================================================
-# Stage 1 — deterministic pre-ranking (NO LLM)
+# Heuristic pre-filter (NO LLM)
 # =================================================
 KEYWORDS = [
-    "randomized",
-    "trial",
-    "phase",
-    "guideline",
-    "meta-analysis",
-    "systematic review",
+    "randomized", "trial", "phase",
+    "guideline", "meta-analysis",
+    "systematic review"
 ]
 
-def heuristic_score(article: Dict[str, Any]) -> int:
-    score = 0
-    text = f"{article['title']} {article['abstract']}".lower()
-
-    for kw in KEYWORDS:
-        if kw in text:
-            score += 2
-
-    if article["abstract"]:
+def heuristic_score(a: Dict[str, Any]) -> int:
+    text = f"{a['title']} {a['abstract']}".lower()
+    score = sum(2 for k in KEYWORDS if k in text)
+    if a["abstract"]:
         score += 1
-
-    if article["year"].isdigit():
-        score += max(0, int(article["year"]) - 2015)
-
+    if a["year"].isdigit():
+        score += max(0, int(a["year"]) - 2016)
     return score
 
 
 def prefilter_articles(articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    scored = [(heuristic_score(a), a) for a in articles]
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [a for _, a in scored[:MAX_LLM_RANK_POOL]]
+    ranked = sorted(
+        articles,
+        key=lambda a: heuristic_score(a),
+        reverse=True,
+    )
+    return ranked[:MAX_LLM_RANK_POOL]
 
 
 # =================================================
@@ -134,23 +135,22 @@ def prefilter_articles(articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def get_openai_client() -> OpenAI:
     key = st.session_state.get("openai_api_key", "").strip()
     if not key:
-        st.warning("Enter your OpenAI API key in the sidebar.")
+        st.warning("Please enter your OpenAI API key in the sidebar.")
         st.stop()
     return OpenAI(api_key=key)
 
 
-def call_with_retry(func, max_retries=5):
-    for i in range(max_retries):
+def call_with_retry(fn, retries=5):
+    for i in range(retries):
         try:
-            return func()
+            return fn()
         except RateLimitError:
-            wait = 2 ** i
-            time.sleep(wait)
-    raise RuntimeError("Repeated rate-limit failures.")
+            time.sleep(2 ** i)
+    raise RuntimeError("Rate limit exceeded repeatedly.")
 
 
 # =================================================
-# Stage 2 — LLM ranking (reduced set only)
+# LLM ranking (progress-aware)
 # =================================================
 def rank_articles_llm(
     client: OpenAI,
@@ -166,9 +166,14 @@ def rank_articles_llm(
             f"{(a['abstract'][:RANK_ABSTRACT_MAX_CHARS])}"
         )
 
-    chunks = [payload[i:i + RANK_CHUNK_SIZE] for i in range(0, len(payload), RANK_CHUNK_SIZE)]
+    chunks = [
+        payload[i:i + RANK_CHUNK_SIZE]
+        for i in range(0, len(payload), RANK_CHUNK_SIZE)
+    ]
 
-    for chunk in chunks:
+    progress = st.progress(0.0, text="Ranking articles by clinical relevance…")
+
+    for idx, chunk in enumerate(chunks):
         def _call():
             return client.responses.create(
                 model=RANK_MODEL,
@@ -176,9 +181,8 @@ def rank_articles_llm(
                     {
                         "role": "system",
                         "content": (
-                            "Score articles by immediate clinical relevance.\n"
-                            "Negative RCTs = intermediate scores, "
-                            "always above basic science or case series."
+                            "Score articles by immediate clinical relevance. "
+                            "Negative RCTs = intermediate score, above basic science."
                         ),
                     },
                     {
@@ -201,19 +205,22 @@ def rank_articles_llm(
                 except:
                     pass
 
+        progress.progress((idx + 1) / len(chunks))
+
+    progress.empty()
     ranked.sort(key=lambda x: x[1], reverse=True)
     return ranked
 
 
 # =================================================
-# Enrichment (Top-N only)
+# Enrichment
 # =================================================
 def summarize(client: OpenAI, abstract: str) -> str:
     if not abstract:
         return "No abstract available."
     return client.responses.create(
         model=ENRICH_MODEL,
-        input=f"Summarize the clinical implication in ≤2 sentences:\n\n{abstract}",
+        input=f"Summarize clinical implications in ≤2 sentences:\n\n{abstract}",
     ).output_text.strip()
 
 
@@ -230,11 +237,10 @@ if not rss:
 
 pmids = fetch_pmids_from_rss(rss)
 articles = fetch_pubmed_articles(pmids)
-
 st.success(f"{len(articles)} articles retrieved.")
 
 filtered = prefilter_articles(articles)
-st.info(f"{len(filtered)} articles passed heuristic pre-filter.")
+st.info(f"{len(filtered)} articles selected for LLM ranking.")
 
 client = get_openai_client()
 ranked = rank_articles_llm(client, filtered)
@@ -243,7 +249,24 @@ top = ranked[:top_k]
 st.markdown("## Results")
 
 for idx, score in top:
-    art = filtered[idx]
-    st.markdown(f"**{art['journal']}, {art['month']} {art['year']} — {art['title']}**")
+    a = filtered[idx]
+
+    # Journal + date (less emphasis)
+    st.markdown(
+        f"<span style='color:#666'>{a['journal']} · {a['month']} {a['year']}</span>",
+        unsafe_allow_html=True,
+    )
+
+    # Clickable bold title
+    if a["doi_url"]:
+        st.markdown(f"[**{a['title']}**]({a['doi_url']})")
+    else:
+        st.markdown(f"**{a['title']}**")
+
     st.caption(f"Relevance score: {score:.1f}")
-    st.markdown(summarize(client, art["abstract"]))
+
+    st.markdown(summarize(client, a["abstract"]))
+
+    # Abstract dropdown
+    with st.expander("Abstract"):
+        st.write(a["abstract"] or "No abstract available.")
