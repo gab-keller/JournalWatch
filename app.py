@@ -210,4 +210,144 @@ def rank_articles_by_relevance(
     got = {i for i, _ in ranked}
     for i in range(len(articles)):
         if i not in got:
-            ra
+            ranked.append((i, 0.0))
+
+    # Sort by score desc
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    return ranked
+
+
+def generate_clinical_summary(client: OpenAI, abstract: str) -> str:
+    if not abstract.strip():
+        return "No abstract available to summarize."
+    response = client.responses.create(
+        model=ENRICH_MODEL,
+        input=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a clinician summarizing medical articles. "
+                    "Be concise, practical, and clinically oriented."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Summarize the most important conclusion of this article and its clinical implications "
+                    "in no more than 2 sentences:\n\n"
+                    f"{abstract}"
+                ),
+            },
+        ],
+    )
+    return response.output_text.strip()
+
+
+def generate_structured_abstract(client: OpenAI, abstract: str) -> str:
+    if not abstract.strip():
+        return "No abstract available."
+    response = client.responses.create(
+        model=ENRICH_MODEL,
+        input=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a medical editor improving readability of abstracts. "
+                    "Highlight clinically relevant findings."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Rewrite the abstract below into structured paragraphs (Background, Methods, Results, Conclusion) "
+                    "WHEN appropriate. If the abstract does not support a clean split, keep logical paragraphs anyway. "
+                    "Bold the most clinically important findings.\n\n"
+                    f"{abstract}"
+                ),
+            },
+        ],
+    )
+    return response.output_text.strip()
+
+
+# -------------------------------------------------
+# Sidebar
+# -------------------------------------------------
+with st.sidebar:
+    st.subheader("OpenAI API Key")
+    st.text_input(
+        "Enter your OpenAI API key",
+        type="password",
+        key="openai_api_key",
+        placeholder="sk-...",
+    )
+    st.markdown("---")
+    st.caption("This step ranks articles (chunked) and then enriches only the top 20.")
+
+
+# -------------------------------------------------
+# RSS input
+# -------------------------------------------------
+rss_url = st.text_input(
+    "Paste PubMed RSS link",
+    placeholder="https://pubmed.ncbi.nlm.nih.gov/rss/search/...",
+)
+
+if not rss_url:
+    st.info("Paste a PubMed RSS link to continue.")
+    st.stop()
+
+
+# -------------------------------------------------
+# Fetch from PubMed
+# -------------------------------------------------
+with st.spinner("Fetching articles from PubMed (RSS → PMIDs → E-utilities)…"):
+    try:
+        pmids = fetch_pmids_from_rss(rss_url)
+        articles = fetch_pubmed_articles(pmids)
+    except Exception as e:
+        st.error(f"Error fetching PubMed articles: {e}")
+        st.stop()
+
+if not articles:
+    st.error("No articles retrieved.")
+    st.stop()
+
+st.success(f"Retrieved {len(articles)} articles from PubMed.")
+
+
+# -------------------------------------------------
+# Rank and keep top 20
+# -------------------------------------------------
+client = get_openai_client()
+
+with st.spinner("Ranking articles by immediate clinical relevance…"):
+    ranked = rank_articles_by_relevance(client, articles)
+
+top_ranked = ranked[: min(TOP_K, len(ranked))]
+top_articles = [(i, score, articles[i]) for i, score in top_ranked]
+
+st.markdown(f"## Top {len(top_articles)} most clinically relevant articles")
+
+
+# -------------------------------------------------
+# Display top 20 with enrichment
+# -------------------------------------------------
+for display_idx, (orig_idx, score, article) in enumerate(top_articles, start=1):
+    header = f"{article.get('journal','')}, {article.get('month','')} {article.get('year','')} — {article.get('title','')}"
+    header = re.sub(r"\s+", " ", header).strip(" ,—")
+
+    # Smaller text (same size as title): use bold inline text, not markdown headings
+    st.markdown(f"**{display_idx}. {header}**")
+    st.caption(f"Relevance score: {score:.1f}/100")
+
+    # Summary immediately under title
+    with st.spinner("Generating clinical summary…"):
+        summary = generate_clinical_summary(client, article.get("abstract", ""))
+    st.markdown(summary)
+
+    # Structured abstract with bold highlights
+    with st.expander("Abstract"):
+        with st.spinner("Formatting abstract…"):
+            structured = generate_structured_abstract(client, article.get("abstract", ""))
+        st.markdown(structured)
