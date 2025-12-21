@@ -1,82 +1,103 @@
 import json
-import tempfile
+import re
+import requests
+import feedparser
 from typing import Any, Dict, List, Optional, Tuple
 
-import pandas as pd
 import streamlit as st
 from openai import OpenAI
+import xml.etree.ElementTree as ET
 
 
 # -------------------------------------------------
 # Page config
 # -------------------------------------------------
-st.set_page_config(page_title="Clinical Article Digest", layout="wide")
+st.set_page_config(page_title="Clinical Article Digest (PubMed RSS)", layout="wide")
 
-st.title("Clinical Article Digest")
+st.title("Clinical Article Digest – PubMed RSS")
 st.caption(
-    "Select the most clinically relevant articles → generate a podcast-style summary → download audio"
+    "Paste a PubMed RSS link → select the most clinically relevant articles → "
+    "generate a podcast-style summary and audio"
 )
 
 
 # -------------------------------------------------
 # Constants
 # -------------------------------------------------
-REQUIRED_COLUMNS = [
-    "DOI",
-    "Journal",
-    "Published Date",
-    "Article Title",
-    "Abstract",
-]
-
 MAX_OUTPUT_ARTICLES = 20
+PUBMED_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 
 
 # -------------------------------------------------
 # Utilities
 # -------------------------------------------------
 def safe_str(x: Any) -> str:
-    if x is None or pd.isna(x):
-        return ""
-    return str(x).strip()
-
-
-def parse_date(x: Any) -> Optional[pd.Timestamp]:
-    try:
-        ts = pd.to_datetime(x, errors="coerce")
-        return None if pd.isna(ts) else ts
-    except Exception:
-        return None
-
-
-def month_year_from_date(ts: Optional[pd.Timestamp]) -> Tuple[str, str]:
-    if ts is None:
-        return "", ""
-    return ts.strftime("%B"), ts.strftime("%Y")
+    return "" if x is None else str(x).strip()
 
 
 def doi_to_url(doi: str) -> str:
     return f"https://doi.org/{doi}" if doi else ""
 
 
-def validate_columns(df: pd.DataFrame) -> List[str]:
-    return [c for c in REQUIRED_COLUMNS if c not in df.columns]
+def extract_pmid_from_link(link: str) -> Optional[str]:
+    """
+    PubMed RSS links usually look like:
+    https://pubmed.ncbi.nlm.nih.gov/12345678/
+    """
+    match = re.search(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d+)/", link)
+    return match.group(1) if match else None
 
 
-def build_articles(df: pd.DataFrame) -> List[Dict[str, Any]]:
+# -------------------------------------------------
+# PubMed RSS + API
+# -------------------------------------------------
+def fetch_pmids_from_rss(rss_url: str) -> List[str]:
+    feed = feedparser.parse(rss_url)
+    pmids = []
+
+    for entry in feed.entries:
+        pmid = extract_pmid_from_link(entry.link)
+        if pmid:
+            pmids.append(pmid)
+
+    return list(dict.fromkeys(pmids))  # de-duplicate
+
+
+def fetch_pubmed_articles(pmids: List[str]) -> List[Dict[str, Any]]:
+    if not pmids:
+        return []
+
+    params = {
+        "db": "pubmed",
+        "retmode": "xml",
+        "id": ",".join(pmids),
+    }
+
+    response = requests.get(PUBMED_EFETCH_URL, params=params, timeout=30)
+    response.raise_for_status()
+
+    root = ET.fromstring(response.text)
     articles = []
 
-    for _, row in df.iterrows():
-        title = safe_str(row.get("Article Title"))
-        if not title:
-            continue
+    for article in root.findall(".//PubmedArticle"):
+        medline = article.find("MedlineCitation")
+        article_data = medline.find("Article")
 
-        doi = safe_str(row.get("DOI"))
-        journal = safe_str(row.get("Journal"))
-        abstract = safe_str(row.get("Abstract"))
+        title = safe_str(article_data.findtext("ArticleTitle"))
+        abstract_elems = article_data.findall(".//AbstractText")
+        abstract = "\n".join([safe_str(a.text) for a in abstract_elems])
 
-        ts = parse_date(row.get("Published Date"))
-        month, year = month_year_from_date(ts)
+        journal = safe_str(article_data.findtext("Journal/Title"))
+
+        # Publication date
+        year = safe_str(article_data.findtext("Journal/JournalIssue/PubDate/Year"))
+        month = safe_str(article_data.findtext("Journal/JournalIssue/PubDate/Month"))
+
+        # DOI
+        doi = ""
+        for id_elem in article.findall(".//ArticleId"):
+            if id_elem.attrib.get("IdType") == "doi":
+                doi = safe_str(id_elem.text)
 
         articles.append(
             {
@@ -84,26 +105,17 @@ def build_articles(df: pd.DataFrame) -> List[Dict[str, Any]]:
                 "month": month,
                 "year": year,
                 "title": title,
+                "abstract": abstract,
                 "doi": doi,
                 "link": doi_to_url(doi),
-                "abstract": abstract,
             }
         )
 
-    # Deduplicate
-    seen = set()
-    out = []
-    for a in articles:
-        key = a["doi"] or a["title"].lower()
-        if key not in seen:
-            seen.add(key)
-            out.append(a)
-
-    return out
+    return articles
 
 
 # -------------------------------------------------
-# OpenAI client (user key)
+# OpenAI
 # -------------------------------------------------
 def get_openai_client() -> OpenAI:
     api_key = st.session_state.get("openai_api_key", "").strip()
@@ -113,25 +125,27 @@ def get_openai_client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 
-# -------------------------------------------------
-# OpenAI processing
-# -------------------------------------------------
-def select_and_enrich_articles(client: OpenAI, model: str, articles: List[Dict[str, Any]]):
+def select_and_enrich_articles(
+    client: OpenAI,
+    model: str,
+    articles: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+
     system_prompt = (
-        "You are a senior clinical neurologist and medical editor. "
-        "Select the most clinically relevant articles and present them clearly for practicing physicians."
+        "You are a senior clinical neurologist and journal editor. "
+        "Identify the articles with the highest immediate clinical relevance."
     )
 
     user_prompt = {
         "instructions": (
-            "If there are more than 20 articles, select ONLY the 20 most clinically relevant. "
-            "Rank them by immediate impact on clinical practice. "
-            "For each selected article, generate:\n"
-            "- A brief clinical summary (max 2 sentences).\n"
-            "- A structured abstract with sections when possible "
-            "(Background, Methods, Results, Conclusion).\n"
-            "- Highlight the most clinically important findings in **bold**.\n\n"
-            "Return ONLY valid JSON."
+            "From the list below:\n"
+            "1. If more than 20 articles, select ONLY the top 20 by immediate clinical impact.\n"
+            "2. Rank them by clinical relevance.\n"
+            "3. For each article, generate:\n"
+            "   - A brief clinical summary (max 2 sentences).\n"
+            "   - A structured abstract (Background, Methods, Results, Conclusion when possible).\n"
+            "   - Highlight key clinically relevant findings in **bold**.\n\n"
+            "Return ONLY valid JSON with key 'articles'."
         ),
         "articles": articles,
     }
@@ -149,41 +163,37 @@ def select_and_enrich_articles(client: OpenAI, model: str, articles: List[Dict[s
 
 
 def generate_podcast_script(client: OpenAI, model: str, selected_articles: List[Dict[str, Any]]) -> str:
-    system_prompt = (
-        "You are a medical podcast host speaking to neurologists. "
-        "Your tone is clear, engaging, and clinically focused."
-    )
-
-    user_prompt = {
-        "task": (
-            "Create a podcast-style script lasting approximately 10 minutes "
-            "(~1300–1500 words). The script should:\n"
-            "- Be written for spoken audio\n"
-            "- Smoothly transition between topics\n"
-            "- Summarize and contextualize the selected studies\n"
-            "- Emphasize clinical relevance and practice implications\n"
-            "- Avoid reading abstracts verbatim\n"
-        ),
-        "articles": selected_articles,
-    }
-
     response = client.responses.create(
         model=model,
         input=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
+            {
+                "role": "system",
+                "content": "You are a medical podcast host speaking to neurologists.",
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "task": (
+                            "Create a podcast-style script of about 10 minutes "
+                            "(~1300–1500 words). Use spoken language, smooth transitions, "
+                            "and emphasize clinical implications."
+                        ),
+                        "articles": selected_articles,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
         ],
     )
-
     return response.output_text
 
 
-def generate_tts_audio(client: OpenAI, script: str) -> bytes:
-    # OpenAI TTS (mp3)
+def generate_tts_audio(client: OpenAI, text: str) -> bytes:
     speech = client.audio.speech.create(
         model="gpt-4o-mini-tts",
         voice="alloy",
-        input=script,
+        input=text,
     )
     return speech.read()
 
@@ -212,46 +222,54 @@ with st.sidebar:
 
 
 # -------------------------------------------------
-# File upload
+# RSS input
 # -------------------------------------------------
-uploaded = st.file_uploader("Upload Excel file (.xlsx)", type=["xlsx"])
+rss_url = st.text_input(
+    "Paste PubMed RSS link",
+    placeholder="https://pubmed.ncbi.nlm.nih.gov/rss/search/...",
+)
 
-if uploaded is None:
-    st.info("Upload an Excel file to continue.")
+if not rss_url:
+    st.info("Paste a PubMed RSS link to continue.")
     st.stop()
 
-df = pd.read_excel(uploaded)
 
-missing = validate_columns(df)
-if missing:
-    st.error(f"Missing required columns: {', '.join(missing)}")
+# -------------------------------------------------
+# Fetch articles
+# -------------------------------------------------
+with st.spinner("Fetching articles from PubMed RSS..."):
+    pmids = fetch_pmids_from_rss(rss_url)
+    articles = fetch_pubmed_articles(pmids)
+
+if not articles:
+    st.error("No articles could be retrieved from this RSS feed.")
     st.stop()
 
-articles = build_articles(df)
+st.success(f"{len(articles)} articles retrieved from PubMed.")
 
+
+# -------------------------------------------------
+# OpenAI enrichment
+# -------------------------------------------------
 with st.spinner("Selecting and enriching the most clinically relevant articles..."):
     client = get_openai_client()
     final_articles = select_and_enrich_articles(client, model, articles)
 
 
 # -------------------------------------------------
-# Output + selection
+# Display + selection
 # -------------------------------------------------
 st.markdown("## Prioritized articles")
 
 selected_for_podcast = []
 
 for i, a in enumerate(final_articles, start=1):
-    checked = st.checkbox(
-        f"Include in podcast: {a['title']}",
-        key=f"select_{i}",
-    )
+    checked = st.checkbox(f"Include in podcast: {a['title']}", key=f"select_{i}")
 
     if checked:
         selected_for_podcast.append(a)
 
     st.markdown(f"**{i}. {a['journal']}, {a['month']} {a['year']}**")
-
     st.markdown(f"[{a['title']}]({a['link']})")
     st.markdown(f"**Clinical summary:** {a['clinical_summary']}")
     st.caption(f"DOI: {a['doi'] or '—'}")
@@ -261,14 +279,14 @@ for i, a in enumerate(final_articles, start=1):
 
 
 # -------------------------------------------------
-# Podcast generation
+# Podcast
 # -------------------------------------------------
 st.markdown("---")
 st.markdown("## 🎙️ Podcast")
 
 if st.button("Generate podcast script from selected articles"):
     if not selected_for_podcast:
-        st.warning("Please select at least one article.")
+        st.warning("Select at least one article.")
     else:
         with st.spinner("Generating podcast script..."):
             script = generate_podcast_script(client, model, selected_for_podcast)
@@ -280,11 +298,10 @@ if "podcast_script" in st.session_state:
 
     if st.button("Generate audio podcast (MP3)"):
         with st.spinner("Generating audio..."):
-            audio_bytes = generate_tts_audio(client, st.session_state["podcast_script"])
-
+            audio = generate_tts_audio(client, st.session_state["podcast_script"])
             st.download_button(
-                label="Download podcast audio (MP3)",
-                data=audio_bytes,
+                "Download podcast audio (MP3)",
+                data=audio,
                 file_name="clinical_podcast.mp3",
                 mime="audio/mpeg",
             )
