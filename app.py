@@ -519,3 +519,14 @@ if st.button("Generate podcast script (≈10 minutes)", disabled=(len(selected_a
 if "podcast_text" in st.session_state:
     with st.expander("Podcast script"):
         st.markdown(st.session_state["podcast_text"])
+
+    if st.button("Generate audio podcast (MP3)"):
+        with st.spinner("Generating audio..."):
+            audio_bytes = generate_tts_audio(client, st.session_state["podcast_script"])
+
+            st.download_button(
+                label="Download podcast audio (MP3)",
+                data=audio_bytes,
+                file_name="clinical_podcast.mp3",
+                mime="audio/mpeg",
+            )
