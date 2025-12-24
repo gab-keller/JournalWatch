@@ -269,6 +269,7 @@ def rank_articles_llm(client: OpenAI, articles: List[Dict[str, Any]]) -> List[Tu
                         "role": "system",
                         "content": (
                             "Score articles by immediate clinical relevance and the probability that they will change the clinical management of patients with cerebrovascular disease."
+                            "Score higher articles that impact the care of acute stroke"
                             "Negative RCTs = intermediate score, above basic science."
                         ),
                     },
@@ -476,45 +477,124 @@ for display_idx, (idx_f, score, a) in enumerate(top_articles, start=1):
 
 
 # =================================================
-# Podcast generation
+# Podcast generation (multi-voice, Streamlit-safe)
 # =================================================
-st.markdown("## Podcast mode")
+st.markdown("## 🎙 Podcast mode")
 
-selected_articles = [filtered[i] for i in sorted(st.session_state["selected_ids"]) if i < len(filtered)]
+# Collect selected articles ONLY (no recomputation)
+selected_articles = [
+    filtered[i]
+    for i in sorted(st.session_state.get("selected_ids", []))
+    if i < len(filtered)
+]
+
 st.write(f"Selected articles: **{len(selected_articles)}**")
 
-def generate_tts_audio(client: OpenAI, script: str) -> bytes:
-    speech = client.audio.speech.create(
-        model="gpt-4o-mini-tts",
-        voice="alloy",
-        input=script,
-    )
-    return speech.read()
+# -----------------------------------------------
+# Speaker → voice mapping
+# -----------------------------------------------
+VOICE_MAP = {
+    "HOST": "alloy",   # neutral, authoritative
+    "GUEST": "verse", # warmer, conversational
+}
+
+# -----------------------------------------------
+# Helper: parse podcast script into speaker blocks
+# -----------------------------------------------
+def parse_podcast_script(script: str):
+    """
+    Parse a script written with:
+    HOST: ...
+    GUEST: ...
+
+    Returns: List of (speaker, text)
+    """
+    segments = []
+    current_speaker = None
+    buffer = []
+
+    for line in script.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        if line.startswith("HOST:") or line.startswith("GUEST:"):
+            if current_speaker and buffer:
+                segments.append((current_speaker, " ".join(buffer)))
+                buffer = []
+
+            current_speaker, content = line.split(":", 1)
+            current_speaker = current_speaker.strip()
+            buffer.append(content.strip())
+        else:
+            buffer.append(line)
+
+    if current_speaker and buffer:
+        segments.append((current_speaker, " ".join(buffer)))
+
+    return segments
 
 
-if st.button("Generate podcast script (≈10 minutes)", disabled=(len(selected_articles) == 0)):
+# -----------------------------------------------
+# Multi-voice TTS generation
+# -----------------------------------------------
+def generate_multivoice_podcast_audio(script: str) -> bytes:
+    client = get_openai_client()
+    segments = parse_podcast_script(script)
+
+    audio_chunks = []
+
+    for speaker, text in segments:
+        voice = VOICE_MAP.get(speaker, "alloy")
+
+        speech = client.audio.speech.create(
+            model=TTS_MODEL,
+            voice=voice,
+            input=text,
+        )
+
+        audio_chunks.append(speech.read())
+
+    # MP3 chunks can be safely concatenated
+    return b"".join(audio_chunks)
+
+
+# -----------------------------------------------
+# Generate podcast script
+# -----------------------------------------------
+if st.button(
+    "Generate podcast script (≈10 minutes)",
+    disabled=(len(selected_articles) == 0),
+):
     with st.spinner("Generating podcast script…"):
+        client = get_openai_client()
+
         podcast_text = cached_generate(
             f"podcast::{_hash_text(str([a['title'] for a in selected_articles]))}",
             lambda: call_with_retry(
-                lambda: get_openai_client().responses.create(
+                lambda: client.responses.create(
                     model=PODCAST_MODEL,
                     input=[
                         {
                             "role": "system",
                             "content": (
-                                "You are a clinician-host producing a practical medical podcast."
-                                "Target length ~10 minutes. Clear, didactic, clinically focused."
+                                "You are a clinician-host producing a medical podcast.\n"
+                                "CRITICAL RULES:\n"
+                                "- Write as a natural conversation.\n"
+                                "- Use ONLY these speaker labels:\n"
+                                "  HOST: and GUEST:\n"
+                                "- Each line MUST start with one of these labels.\n"
+                                "- Target duration: ~10 minutes.\n"
+                                "- Focus on key results and clinical implications."
                             ),
                         },
                         {
                             "role": "user",
                             "content": (
-                                "Create a podcast-style script summarizing these articles, "
-                                "Write the podcast in a conversation format (questions by the host and answers by the invitee), so that the text can be made available to a TTS feature and sound like a natural and fluid conversation"
-                                "highlighting key results and clinical implications:\n\n"
+                                "Create a podcast-style discussion of the following articles.\n\n"
                                 + "\n\n".join(
-                                    f"{a['title']}\n{truncate_text(a.get('abstract',''), 1500)}"
+                                    f"{a['title']}\n"
+                                    f"{truncate_text(a.get('abstract',''), 1500)}"
                                     for a in selected_articles
                                 )
                             ),
@@ -523,19 +603,26 @@ if st.button("Generate podcast script (≈10 minutes)", disabled=(len(selected_a
                 ).output_text.strip()
             ),
         )
+
     st.session_state["podcast_text"] = podcast_text
 
+
+# -----------------------------------------------
+# Display script + generate audio
+# -----------------------------------------------
 if "podcast_text" in st.session_state:
-    with st.expander("Podcast script"):
+    with st.expander("📄 Podcast script"):
         st.markdown(st.session_state["podcast_text"])
 
     if st.button("Generate audio podcast (MP3)"):
-        with st.spinner("Generating audio..."):
-            audio_bytes = generate_tts_audio(client, st.session_state["podcast_script"])
-
-            st.download_button(
-                label="Download podcast audio (MP3)",
-                data=audio_bytes,
-                file_name="clinical_podcast.mp3",
-                mime="audio/mpeg",
+        with st.spinner("Generating multi-voice audio…"):
+            audio_bytes = generate_multivoice_podcast_audio(
+                st.session_state["podcast_text"]
             )
+
+        st.download_button(
+            label="Download podcast audio (MP3)",
+            data=audio_bytes,
+            file_name="clinical_podcast_multivoice.mp3",
+            mime="audio/mpeg",
+        )
