@@ -1,3 +1,6 @@
+# =================================================
+# Imports
+# =================================================
 import re
 import time
 import hashlib
@@ -21,26 +24,36 @@ st.caption(
     "structured abstracts and podcast mode"
 )
 
+
 # =================================================
-# Constants
+# Constants (DEFINED EARLY)
 # =================================================
 PUBMED_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-
-RANK_CHUNK_SIZE = 10
-RANK_ABSTRACT_MAX_CHARS = 1200
 
 RANK_MODEL = "gpt-4.1"
 ENRICH_MODEL = "gpt-4.1"
 PODCAST_MODEL = "gpt-4.1"
 
+RANK_CHUNK_SIZE = 10
+RANK_ABSTRACT_MAX_CHARS = 1200
+
 RSS_PRESETS = {
-    "Neurovascular (last three months)": "https://pubmed.ncbi.nlm.nih.gov/rss/search/1pMPQVclnMM8hoClXf46VJRk2UJoMOEwMqY_dcxDxxSnsm1MyU/?limit=100&utm_campaign=pubmed-2&fc=20251224163345",
-    "Neurovascular (last year)": "https://pubmed.ncbi.nlm.nih.gov/rss/search/1B3BG_B5Yy7ac5xlgtFJnBammAP6bZfKOpXYiqFqF7-TrXvoBy/?limit=100&utm_campaign=pubmed-2&fc=20251224163713",
+    "Neurovascular (last three months)": (
+        "https://pubmed.ncbi.nlm.nih.gov/rss/search/"
+        "1pMPQVclnMM8hoClXf46VJRk2UJoMOEwMqY_dcxDxxSnsm1MyU/"
+        "?limit=100&utm_campaign=pubmed-2&fc=20251224163345"
+    ),
+    "Neurovascular (last year)": (
+        "https://pubmed.ncbi.nlm.nih.gov/rss/search/"
+        "1B3BG_B5Yy7ac5xlgtFJnBammAP6bZfKOpXYiqFqF7-TrXvoBy/"
+        "?limit=100&utm_campaign=pubmed-2&fc=20251224163713"
+    ),
     "Custom PubMed RSS link": None,
 }
 
+
 # =================================================
-# Utility helpers
+# Generic utilities
 # =================================================
 def _hash_text(s: str) -> str:
     return hashlib.sha256((s or "").encode("utf-8")).hexdigest()
@@ -68,21 +81,6 @@ def get_openai_client() -> OpenAI:
     return OpenAI(api_key=key)
 
 
-def get_llm_cache() -> Dict[str, str]:
-    if "llm_cache" not in st.session_state:
-        st.session_state["llm_cache"] = {}
-    return st.session_state["llm_cache"]
-
-
-def cached_generate(key: str, fn):
-    cache = get_llm_cache()
-    if key in cache:
-        return cache[key]
-    out = fn()
-    cache[key] = out
-    return out
-
-
 def truncate_text(text: str, max_chars: int) -> str:
     text = (text or "").strip()
     return text if len(text) <= max_chars else text[:max_chars].rstrip() + "…"
@@ -93,7 +91,7 @@ def chunk_list(items: List[Any], size: int) -> List[List[Any]]:
 
 
 # =================================================
-# RSS / PubMed
+# PubMed helpers
 # =================================================
 def extract_pmid_from_link(link: str) -> Optional[str]:
     m = re.search(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d+)/", link)
@@ -165,12 +163,12 @@ def fetch_pubmed_articles(pmids: List[str]) -> List[Dict[str, Any]]:
 
 
 # =================================================
-# Heuristic scoring
+# Heuristic score
 # =================================================
 def heuristic_score(a: Dict[str, Any]) -> int:
-    score = 0
     journal = (a.get("journal") or "").lower()
     text = f"{a.get('title','')} {a.get('abstract','')}".lower()
+    score = 0
 
     if "new england journal of medicine" in journal:
         score += 50
@@ -189,26 +187,6 @@ def heuristic_score(a: Dict[str, Any]) -> int:
     else:
         score += 15
 
-    if "phase 3" in text or "phase iii" in text:
-        score += 12
-    elif "phase 2" in text or "phase ii" in text:
-        score += 8
-
-    if "multicenter" in text:
-        score += 6
-    if "international" in text:
-        score += 4
-
-    HARD = ["mortality", "functional outcome", "modified rankin", "stroke recurrence"]
-    SURROGATE = ["imaging", "biomarker", "feasibility"]
-
-    for k in HARD:
-        if k in text:
-            score += 3
-    for k in SURROGATE:
-        if k in text:
-            score -= 3
-
     if any(k in text for k in ["no benefit", "did not improve", "noninferior", "superior"]):
         score += 5
 
@@ -217,6 +195,51 @@ def heuristic_score(a: Dict[str, Any]) -> int:
 
 def prefilter_articles(articles: List[Dict[str, Any]], max_pool: int):
     return sorted(articles, key=heuristic_score, reverse=True)[:max_pool]
+
+
+# =================================================
+# LLM ranking (THIS WAS MISSING)
+# =================================================
+def rank_articles_llm(client: OpenAI, articles: List[Dict[str, Any]]) -> List[Tuple[int, float]]:
+    payload = [
+        f"{i} | {a['title']} | {a['journal']} | "
+        f"{truncate_text(a['abstract'], RANK_ABSTRACT_MAX_CHARS)}"
+        for i, a in enumerate(articles)
+    ]
+
+    chunks = chunk_list(payload, RANK_CHUNK_SIZE)
+    ranked: List[Tuple[int, float]] = []
+
+    progress = st.progress(0.0, text="Ranking articles by clinical relevance…")
+
+    for ci, chunk in enumerate(chunks):
+        resp = call_with_retry(
+            lambda: client.responses.create(
+                model=RANK_MODEL,
+                input=[
+                    {"role": "system", "content": "Score clinical relevance 0–100."},
+                    {
+                        "role": "user",
+                        "content": "Return strictly: id | score\n\n" + "\n".join(chunk),
+                    },
+                ],
+            )
+        )
+
+        for line in resp.output_text.splitlines():
+            if "|" not in line:
+                continue
+            try:
+                i, s = line.split("|", 1)
+                ranked.append((int(i.strip()), float(s.strip())))
+            except Exception:
+                continue
+
+        progress.progress((ci + 1) / len(chunks))
+
+    progress.empty()
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    return ranked
 
 
 # =================================================
@@ -246,9 +269,8 @@ with st.sidebar:
 if not rss_url:
     st.stop()
 
-with st.spinner("Fetching articles from PubMed…"):
-    pmids = fetch_pmids_from_rss(rss_url)
-    articles = fetch_pubmed_articles(pmids)
+pmids = fetch_pmids_from_rss(rss_url)
+articles = fetch_pubmed_articles(pmids)
 
 if not articles:
     st.error("No articles retrieved.")
@@ -257,35 +279,26 @@ if not articles:
 filtered = prefilter_articles(articles, int(max_llm_rank_pool))
 
 ranking_signature = (rss_url, int(max_llm_rank_pool))
-
 if "ranking_signature" not in st.session_state or st.session_state["ranking_signature"] != ranking_signature:
     client = get_openai_client()
-    with st.spinner("Ranking articles by clinical relevance…"):
-        ranked = rank_articles_llm(client, filtered)
+    ranked = rank_articles_llm(client, filtered)
     st.session_state["ranked"] = ranked
     st.session_state["ranking_signature"] = ranking_signature
 else:
     ranked = st.session_state["ranked"]
 
-top_ranked = ranked[:min(int(top_k), len(ranked))]
+top_ranked = ranked[: min(int(top_k), len(ranked))]
 top_articles = [(i, score, filtered[i]) for i, score in top_ranked]
 
 
 # =================================================
 # Render
 # =================================================
-if "selected_ids" not in st.session_state:
-    st.session_state["selected_ids"] = set()
-
 st.markdown("## Ranked results")
 
-for display_idx, (idx_f, score, a) in enumerate(top_articles, 1):
+for display_idx, (idx, score, a) in enumerate(top_articles, 1):
     st.markdown(f"<span style='color:#666'>{a['journal']} · {a['month']} {a['year']}</span>", unsafe_allow_html=True)
-    title_md = f"[**{a['title']}**]({a['doi_url']})" if a["doi_url"] else f"**{a['title']}**"
-    st.markdown(f"{display_idx}. {title_md}")
+    title = f"[**{a['title']}**]({a['doi_url']})" if a["doi_url"] else f"**{a['title']}**"
+    st.markdown(f"{display_idx}. {title}")
     st.caption(f"Relevance score: {score:.1f}/100")
-
-    checked = st.checkbox("Select for podcast", key=f"sel_{idx_f}", value=idx_f in st.session_state["selected_ids"])
-    (st.session_state["selected_ids"].add(idx_f) if checked else st.session_state["selected_ids"].discard(idx_f))
-
     st.markdown("---")
