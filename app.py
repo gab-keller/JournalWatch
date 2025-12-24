@@ -494,7 +494,7 @@ if st.button("Generate podcast script (≈10 minutes)", disabled=(len(selected_a
                         {
                             "role": "system",
                             "content": (
-                                "You are a clinician-host producing a practical medical podcast. "
+                                "You are a clinician-host producing a practical medical podcast."
                                 "Target length ~10 minutes. Clear, didactic, clinically focused."
                             ),
                         },
@@ -502,6 +502,7 @@ if st.button("Generate podcast script (≈10 minutes)", disabled=(len(selected_a
                             "role": "user",
                             "content": (
                                 "Create a podcast-style script summarizing these articles, "
+                                "Write the podcast in a conversation format (questions by the host and answers by the invitee), so that the text can be made available to a TTS feature and sound like a natural and fluid conversation"
                                 "highlighting key results and clinical implications:\n\n"
                                 + "\n\n".join(
                                     f"{a['title']}\n{truncate_text(a.get('abstract',''), 1500)}"
