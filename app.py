@@ -126,22 +126,72 @@ def chunk_list(items: List[Any], size: int) -> List[List[Any]]:
 
 
 # =================================================
-# Heuristic prefilter
+# Heuristic score (journal-centric, RCT-aware)
 # =================================================
 def heuristic_score(a: Dict[str, Any]) -> int:
-    text = f"{a.get('title','')} {a.get('abstract','')}".lower()
     score = 0
+    journal = (a.get("journal") or "").lower()
+    text = f"{a.get('title','')} {a.get('abstract','')}".lower()
 
-    for k in KEYWORDS:
-        if k in text:
-            score += 2
+    # Journal prestige
+    if "new england journal of medicine" in journal:
+        score += 50
+    elif journal.startswith("lancet"):
+        score += 45
+    elif journal == "jama":
+        score += 42
+    elif "jama neurology" in journal:
+        score += 38
+    elif "jama network open" in journal:
+        score += 34
+    elif journal == "stroke":
+        score += 30
+    elif journal == "neurology":
+        score += 26
+    else:
+        score += 15
 
-    if a.get("abstract"):
-        score += 1
+    # Phase / scale signals
+    if "phase 3" in text or "phase iii" in text:
+        score += 12
+    elif "phase 2" in text or "phase ii" in text:
+        score += 8
 
-    y = a.get("year", "")
-    if y.isdigit():
-        score += max(0, int(y) - 2016)
+    if "multicenter" in text or "multi-center" in text:
+        score += 6
+    if "international" in text:
+        score += 4
+    if "pragmatic" in text:
+        score += 4
+
+    # Hard outcomes vs surrogates
+    HARD_OUTCOMES = [
+        "mortality", "death", "functional outcome", "disability",
+        "modified rankin", "stroke recurrence", "hospitalization",
+        "major bleeding",
+    ]
+    SURROGATES = [
+        "imaging", "biomarker", "surrogate",
+        "feasibility", "pharmacokinetic",
+    ]
+
+    for kw in HARD_OUTCOMES:
+        if kw in text:
+            score += 3
+    for kw in SURROGATES:
+        if kw in text:
+            score -= 3
+
+    # Decision-changing language (positive or negative RCTs)
+    DECISION_TERMS = [
+        "did not improve", "no benefit", "no significant difference",
+        "superior", "noninferior", "non-inferior",
+        "reduced risk", "head-to-head", "first",
+        "questions current practice", "supports",
+    ]
+    for kw in DECISION_TERMS:
+        if kw in text:
+            score += 5
 
     return score
 
@@ -149,50 +199,6 @@ def heuristic_score(a: Dict[str, Any]) -> int:
 def prefilter_articles(articles: List[Dict[str, Any]], max_pool: int) -> List[Dict[str, Any]]:
     ranked = sorted(articles, key=lambda a: heuristic_score(a), reverse=True)
     return ranked[:max_pool]
-
-
-# =================================================
-# OpenAI helpers
-# =================================================
-def get_openai_client() -> OpenAI:
-    key = st.session_state.get("openai_api_key", "").strip()
-    if not key:
-        st.warning("Please enter your OpenAI API key in the sidebar.")
-        st.stop()
-    return OpenAI(api_key=key)
-
-
-def call_with_retry(fn, retries: int = 6):
-    last_err = None
-    for i in range(retries):
-        try:
-            return fn()
-        except RateLimitError as e:
-            last_err = e
-            time.sleep(max(0.8, 0.8 * (2 ** i)))
-        except Exception as e:
-            last_err = e
-            time.sleep(0.5)
-    raise last_err if last_err else RuntimeError("Unknown failure")
-
-
-def _hash_text(s: str) -> str:
-    return hashlib.sha256((s or "").encode("utf-8")).hexdigest()
-
-
-def get_llm_cache() -> Dict[str, str]:
-    if "llm_cache" not in st.session_state:
-        st.session_state["llm_cache"] = {}
-    return st.session_state["llm_cache"]
-
-
-def cached_generate(cache_key: str, generator_fn) -> str:
-    cache = get_llm_cache()
-    if cache_key in cache:
-        return cache[cache_key]
-    out = generator_fn()
-    cache[cache_key] = out
-    return out
 
 
 # =================================================
@@ -336,11 +342,28 @@ def generate_structured_abstract(client: OpenAI, abstract: str) -> str:
 
 
 # =================================================
-# Sidebar
+# Sidebar (RSS selector updated)
 # =================================================
 with st.sidebar:
     st.subheader("OpenAI")
     st.text_input("OpenAI API key", type="password", key="openai_api_key")
+
+    st.markdown("---")
+    st.subheader("RSS source")
+
+    rss_choice = st.selectbox(
+        "Choose PubMed RSS source",
+        options=list(RSS_PRESETS.keys()),
+        index=0,
+    )
+
+    if rss_choice == "Custom PubMed RSS link":
+        rss_url = st.text_input(
+            "Paste custom PubMed RSS link",
+            placeholder="https://pubmed.ncbi.nlm.nih.gov/rss/search/...",
+        )
+    else:
+        rss_url = RSS_PRESETS[rss_choice]
 
     st.markdown("---")
     st.subheader("Ranking settings")
