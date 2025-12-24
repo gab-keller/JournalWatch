@@ -268,7 +268,7 @@ def rank_articles_llm(client: OpenAI, articles: List[Dict[str, Any]]) -> List[Tu
                     {
                         "role": "system",
                         "content": (
-                            "Score articles by immediate clinical relevance. "
+                            "Score articles by immediate clinical relevance and the probability that they will change the clinical management of patients with cerebrovascular disease."
                             "Negative RCTs = intermediate score, above basic science."
                         ),
                     },
@@ -482,6 +482,15 @@ st.markdown("## Podcast mode")
 
 selected_articles = [filtered[i] for i in sorted(st.session_state["selected_ids"]) if i < len(filtered)]
 st.write(f"Selected articles: **{len(selected_articles)}**")
+
+def generate_tts_audio(client: OpenAI, script: str) -> bytes:
+    speech = client.audio.speech.create(
+        model="gpt-4o-mini-tts",
+        voice="alloy",
+        input=script,
+    )
+    return speech.read()
+
 
 if st.button("Generate podcast script (≈10 minutes)", disabled=(len(selected_articles) == 0)):
     with st.spinner("Generating podcast script…"):
